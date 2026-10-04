@@ -1,1 +1,9 @@
 .DS_Store
+
+# Local credentials/configuration must not be committed.
+*.local.*
+.env
+.env.*
+private/
+backups/
+node_modules/

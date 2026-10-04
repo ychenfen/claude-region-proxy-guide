@@ -1,3 +1,5 @@
+// 初版参考：包含 DIRECT 兜底、国内直连和绕过固定出口的选项。
+// 2026-10-04 固定出口与中转自动切换方案见 examples/fixed-egress-failover.js。
 function main(config) {
   // ================= 1. 核心配置区域 =================
   const staticProxyConfig = {
