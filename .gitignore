@@ -1,1 +1,17 @@
 .DS_Store
+.idea/
+# Private UI screenshots remain local, not in the public tree.
+images/
+链式代理脚本images/
+.env
+.env.*
+*.local.*
+*.private.*
+*.bak
+*.before
+*.zip
+*.ledger.json
+private/
+reports/
+backups/
+node_modules/
