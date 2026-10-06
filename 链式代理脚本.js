@@ -1,153 +1,109 @@
-// 初版参考：包含 DIRECT 兜底、国内直连和绕过固定出口的选项。
-// 2026-10-04 固定出口与中转自动切换方案见 examples/fixed-egress-failover.js。
-function main(config) {
-  // ================= 1. 核心配置区域 =================
-  const staticProxyConfig = {
-    name: "🔒 静态IP (出口)",
-    server: "xxx.xxx.xxx.xxx",
-    port: xxx,
-    username: "xxxxx",
-    password: "xxxxx",
-    type: "socks5",
-    udp: true,
-    "skip-cert-verify": true, // 优化：跳过证书验证，提高链式代理连通性
-  };
+// Public template. Real nodes/credentials stay in the client's private config.
+// Not a complete subscription or an OS kill switch. Read README before enabling.
+const SETTINGS = Object.freeze({
+  enabled: false,
+  exitNode: "US_EXIT",
+  relayNode: "RELAY_NODE",
+  exitServer: "203.0.113.10", // Documentation address; replace LOCALLY.
+  exitPort: 1080,
+  group: "Fixed-Egress",
+  httpPort: 17897,
+  appManagedSocks: false,
+  bootstrapDoh: "https://1.1.1.1/dns-query"
+});
 
-  const groupAirportName = "✈️ 机场中转池";
-  const groupFinalName = "🚀 最终出口选择";
-
-  // ================= 2. 规则优化 (使用 GEOSITE 替代冗长列表) =================
-  // 优化点 1: 移除硬编码的几百个域名，使用 Meta 内核的 GEOSITE 数据库
-  const optimizedDirectRules = [
-    // --- 强制直连与局域网 ---
-    "GEOSITE,private,DIRECT",
-    "GEOSITE,category-ads-all,REJECT", // 顺便拦截一下广告
-
-    // --- IP 段 (核心网络) ---
+function main(input) {
+  if (!SETTINGS.enabled) return input;
+  const config = JSON.parse(JSON.stringify(input));
+  const proxies = config.proxies || [];
+  const byName = new Map();
+  let valid = SETTINGS.exitNode !== SETTINGS.relayNode;
+  const reservedNames = new Set(["DIRECT", "REJECT", "GLOBAL", SETTINGS.group]);
+  for (const proxy of proxies) {
+    if (byName.has(proxy.name)) valid = false;
+    byName.set(proxy.name, proxy);
+  }
+  const exit = byName.get(SETTINGS.exitNode), relay = byName.get(SETTINGS.relayNode);
+  const ipv4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(SETTINGS.exitServer) && SETTINGS.exitServer.split(".").every(n => Number(n) <= 255);
+  valid = valid && ipv4 && Number.isInteger(SETTINGS.exitPort) && SETTINGS.exitPort > 0 && SETTINGS.exitPort <= 65535 &&
+    !!exit && exit.type === "socks5" && !!relay && exit.server === SETTINGS.exitServer && Number(exit.port) === SETTINGS.exitPort;
+  if (exit) exit["dialer-proxy"] = SETTINGS.relayNode;
+  const kept = new Set(), visiting = new Set();
+  function retain(name) {
+    if (reservedNames.has(name) || visiting.has(name)) return false;
+    if (kept.has(name)) return true;
+    const proxy = byName.get(name);
+    if (!proxy || ["direct", "reject", "pass"].includes(proxy.type)) return false;
+    visiting.add(name);
+    if (proxy["dialer-proxy"] && !retain(proxy["dialer-proxy"])) return false;
+    visiting.delete(name);
+    kept.add(name);
+    return true;
+  }
+  valid = valid && retain(SETTINGS.exitNode);
+  config.proxies = valid ? proxies.filter(p => kept.has(p.name)).map(p => {
+    p["skip-cert-verify"] = false;
+    if (p.name === SETTINGS.exitNode) p.udp = false;
+    return p;
+  }) : [];
+  config["proxy-groups"] = [{name: SETTINGS.group, type: "select", proxies: [valid ? SETTINGS.exitNode : "REJECT"]}];
+  delete config["proxy-providers"];
+  delete config["rule-providers"];
+  delete config["sub-rules"];
+  delete config.tunnels;
+  config.mode = "rule";
+  config["allow-lan"] = false;
+  config["bind-address"] = "127.0.0.1";
+  for (const key of ["port", "socks-port", "mixed-port", "redir-port", "tproxy-port"]) {
+    if (Number(config[key]) === SETTINGS.httpPort) throw new Error("Local HTTP port conflicts with an existing inbound; stop deployment.");
+  }
+  const listeners = config.listeners || [];
+  for (const listener of listeners) {
+    if (listener.name === "fixed-egress-http") continue;
+    const conflict = String(listener.port).split(",").some(part => {
+      const range = /^(\d+)-(\d+)$/.exec(part.trim());
+      return range ? SETTINGS.httpPort >= Number(range[1]) && SETTINGS.httpPort <= Number(range[2]) : Number(part) === SETTINGS.httpPort;
+    });
+    if (conflict) throw new Error("Local HTTP listener port conflict; stop deployment.");
+  }
+  config.listeners = listeners.filter(p => p.name !== "fixed-egress-http").map(p => {
+    delete p.proxy;
+    delete p["rule-set"];
+    return p;
+  });
+  config.listeners.push({name: "fixed-egress-http", type: "http", listen: "127.0.0.1", port: SETTINGS.httpPort});
+  config.rules = [
     "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+    "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
     "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
     "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
-    "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
-    "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
+    "IP-CIDR,169.254.0.0/16,DIRECT,no-resolve",
     "IP-CIDR,224.0.0.0/4,DIRECT,no-resolve",
-
-    // --- 进程匹配 ---
-    "PROCESS-NAME,Thunder,DIRECT",
-    "PROCESS-NAME,Transmission,DIRECT",
-    "PROCESS-NAME,uTorrent,DIRECT",
-    "PROCESS-NAME,qBittorrent,DIRECT",
-    "PROCESS-NAME,aria2c,DIRECT",
-
-    // --- 核心优化：国内域名统配 ---
-    // 包含 baidu, qq, alibaba, apple.cn, microsoft.cn 等所有国内常见域名
-    "GEOSITE,cn,DIRECT",
-
-    // --- 游戏平台国内CDN ---
-    "GEOSITE,steam@cn,DIRECT",
-    "GEOSITE,category-games@cn,DIRECT",
-
-    // --- 兜底国内 IP ---
-    "GEOIP,CN,DIRECT",
+    "IP-CIDR6,::1/128,DIRECT,no-resolve",
+    "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
+    "IP-CIDR6,ff02::/16,DIRECT,no-resolve",
+    "NETWORK,UDP,REJECT",
+    "IP-CIDR6,::/0,REJECT,no-resolve"
   ];
-
-  // ================= 3. 提取与构建节点 (优化节点清洗) =================
-
-  // 优化点 3: 过滤节点，排除特殊节点和静态IP自身，防止循环引用
-  // 只提取出网协议节点 (SS/VMess/Trojan/HTTP/Socks5等)，排除 DIRECT/REJECT 等
-  const validNodeTypes = [
-    "ss",
-    "vmess",
-    "vless",
-    "trojan",
-    "hysteria",
-    "hysteria2",
-    "tuic",
-    "ssr",
-    "snell",
-    "socks5",
-    "http",
-  ];
-
-  // 确保 config.proxies 存在
-  if (!config.proxies) config.proxies = [];
-
-  const airportProxies = config.proxies
-    .filter(
-      (p) =>
-        validNodeTypes.includes(p.type) && p.name !== staticProxyConfig.name
-    )
-    .map((p) => p.name);
-
-  // 防错：如果没找到任何节点，给一个 DIRECT 防止报错
-  if (airportProxies.length === 0) airportProxies.push("DIRECT");
-
-  // 添加静态 IP (设置 dialer-proxy 指向机场池)
-  staticProxyConfig["dialer-proxy"] = groupAirportName;
-  // 使用 unshift 将静态节点加到列表最前，方便调试
-  config.proxies.unshift(staticProxyConfig);
-
-  // ================= 4. 分组策略优化 (自动容灾) =================
-
-  config["proxy-groups"] = [
-    {
-      name: groupFinalName,
-      type: "select",
-      proxies: [
-        staticProxyConfig.name, // 默认：走静态IP链式代理
-        groupAirportName, // 备用：不走静态IP，直接走机场
-      ],
-    },
-    {
-      // 优化点 2: 将 Select 改为 url-test，实现自动容灾
-      // 静态 IP 依赖这个池子出网，必须保证这个池子里的节点永远是通的
-      name: groupAirportName,
-      type: "url-test",
-      url: "http://www.gstatic.com/generate_204",
-      interval: 300,
-      tolerance: 150,
-      lazy: true,
-      proxies: airportProxies,
-    },
-  ];
-
-  // ================= 5. 规则逻辑优化 (高效清洗) =================
-
-  // 优化点 4: 更高效的规则合并与清洗逻辑
-  const finalRules = [...optimizedDirectRules];
-
-  if (config.rules && config.rules.length > 0) {
-    config.rules.forEach((rule) => {
-      // 快速分割
-      const parts = rule.split(",");
-      if (parts.length < 2) return;
-
-      const ruleType = parts[0].trim().toUpperCase();
-      // 获取策略部分（处理 no-resolve 的情况）
-      const isNoResolve =
-        parts[parts.length - 1].trim().toLowerCase() === "no-resolve";
-      const policyIndex = isNoResolve ? parts.length - 2 : parts.length - 1;
-      const originalPolicy = parts[policyIndex].trim();
-
-      // 逻辑：保留 DIRECT 和 REJECT，其他的全部重定向到 groupFinalName
-      if (
-        originalPolicy === "DIRECT" ||
-        originalPolicy === "REJECT" ||
-        originalPolicy.startsWith("REJECT")
-      ) {
-        finalRules.push(rule);
-      } else if (ruleType !== "MATCH") {
-        // 修改目标策略
-        parts[policyIndex] = groupFinalName;
-        finalRules.push(parts.join(","));
-      }
-    });
+  if (SETTINGS.appManagedSocks && ipv4 && Number.isInteger(SETTINGS.exitPort) && SETTINGS.exitPort > 0 && SETTINGS.exitPort <= 65535) {
+    config.rules.push(`AND,((NETWORK,TCP),(IP-CIDR,${SETTINGS.exitServer}/32),(DST-PORT,${SETTINGS.exitPort})),${valid ? SETTINGS.relayNode : "REJECT"}`);
   }
-
-  // 确保最后一条是 MATCH 且指向最终分组
-  finalRules.push(`MATCH,${groupFinalName}`);
-
-  // 应用新规则
-  config.rules = finalRules;
-
+  config.rules.push(`MATCH,${SETTINGS.group}`);
+  config.ipv6 = true; // Keep IPv6 capture; disabling AAAA alone is not a firewall.
+  config.tun = Object.assign({}, config.tun, {
+    "strict-route": true, "dns-hijack": ["any:53", "tcp://any:53"]
+  }); // Preserve enable/stack/device; inspect route/process exclusions separately.
+  if (!/^https:\/\/(\d{1,3}\.){3}\d{1,3}(:\d+)?\/dns-query$/.test(SETTINGS.bootstrapDoh)) {
+    throw new Error("Use a locally validated literal-IP HTTPS bootstrap resolver; stop deployment.");
+  }
+  config.dns = Object.assign({}, config.dns, {
+    enable: true, ipv6: false, "prefer-h3": false, "respect-rules": false,
+    "default-nameserver": ["1.1.1.1"],
+    nameserver: [`https://1.1.1.1/dns-query#${SETTINGS.group}`, `https://8.8.8.8/dns-query#${SETTINGS.group}`],
+    fallback: [], "nameserver-policy": {}, "direct-nameserver": [],
+    "proxy-server-nameserver": [SETTINGS.bootstrapDoh]
+  });
+  delete config.dns["proxy-server-nameserver-policy"];
+  delete config.dns["skip-cert-verify"];
   return config;
 }
